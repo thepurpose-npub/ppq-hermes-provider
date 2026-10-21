@@ -1,0 +1,5 @@
+name: ppq
+kind: model-provider
+version: 0.3.0
+description: "PayPerQ — OpenAI-compatible inference API (layered picker defaults: user pins file, then live top chat models, then generic fallback)"
+author: PayPerQ
