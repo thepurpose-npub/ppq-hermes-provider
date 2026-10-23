@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
+from hermes_constants import get_hermes_home
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -18,19 +20,33 @@ from providers.base import ProviderProfile
 # `ppq-price-watch` cron job running ~/.hermes/scripts/ppq_price_watch.py —
 # and prices each response from it.
 #
-# Snapshot path: $HERMES_HOME/ppq-pricing/prices.json
+# Snapshot path: $HERMES_HOME/plugin-data/ppq/prices.json (per ACTIVE profile;
+# resolved at call time via _plugin_data_dir(), never frozen at import)
 #   { "fetched_at": iso8601, "source": url,
 #     "models": { "<model id>": {"input": usd_per_1M|null, "output": ...,
 #                                "cache_read": ..., "ui_input": ...,
 #                                "name": ..., "provider": ...} } }
 
-_PRICES_PATH = os.path.join(
-    os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
-    "ppq-pricing",
-    "prices.json",
-)
+
+def _plugin_data_dir() -> str:
+    """Per-profile plugin state dir: <active hermes home>/plugin-data/ppq.
+
+    get_hermes_home() follows the active context/profile (context-local
+    override -> HERMES_HOME env -> platform default), so every profile reads
+    its own files instead of the launch profile's. Resolved per call, never
+    at import.
+    """
+    return os.path.join(str(get_hermes_home()), "plugin-data", "ppq")
+
+
+def _prices_path() -> str:
+    return os.path.join(_plugin_data_dir(), "prices.json")
+
+
 _PRICES_TTL_S = 300.0
-_prices_cache: tuple[float, dict, dict] | None = None
+# Cache keyed by resolved path: one process can serve several profiles via
+# context-local overrides, so a profile-A table must never be served to B.
+_prices_cache: tuple[float, str, dict, dict] | None = None
 _prices_meta: dict = {}
 
 
@@ -42,11 +58,11 @@ def load_ppq_prices(path: str | None = None) -> dict:
     metadata (fetch time, source URL) lands in the module-level _prices_meta.
     """
     global _prices_cache, _prices_meta
-    target = path or _PRICES_PATH
+    target = path or _prices_path()
     now = time.monotonic()
-    if _prices_cache and _prices_cache[0] > now and (path is None or path == _PRICES_PATH):
-        _prices_meta = _prices_cache[2]
-        return _prices_cache[1]
+    if _prices_cache and _prices_cache[0] > now and _prices_cache[1] == target:
+        _prices_meta = _prices_cache[3]
+        return _prices_cache[2]
     table: dict = {}
     meta: dict = {}
     try:
@@ -58,7 +74,7 @@ def load_ppq_prices(path: str | None = None) -> dict:
             meta = {k: data.get(k) for k in ("fetched_at", "source", "model_count")}
     except Exception:
         table, meta = {}, {}
-    _prices_cache = (now + _PRICES_TTL_S, table, meta)
+    _prices_cache = (now + _PRICES_TTL_S, target, table, meta)
     _prices_meta = meta
     return table
 
@@ -118,7 +134,7 @@ def _zdr_known_models(base_url: str | None) -> frozenset[str]:
 # (``fallback_models``, merged ahead of the live /v1/models list, tuple
 # order = picker order) resolves in layers:
 #
-#   Layer A — user-local overrides: $HERMES_HOME/ppq-plugin/pins.json
+#   Layer A — user-local overrides: $HERMES_HOME/plugin-data/ppq/pins.json
 #             (a JSON list of model ids, or {"models": [...]}, non-empty).
 #             Present and valid → pins come ENTIRELY from this file. This is
 #             how the author — or any user — keeps personal pins (including
@@ -138,13 +154,12 @@ def _zdr_known_models(base_url: str | None) -> frozenset[str]:
 #
 # With no pins.json and the stats endpoint down, a fresh install sees only
 # Layer C ahead of the live catalog — a safe start, not the author's setup.
-_PINS_PATH = os.path.join(
-    os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
-    "ppq-plugin",
-    "pins.json",
-)
+def _pins_path() -> str:
+    return os.path.join(_plugin_data_dir(), "pins.json")
+
+
 _PINS_TTL_S = 60.0
-_pins_cache: tuple[float, list[str] | None] | None = None
+_pins_cache: tuple[float, str, list[str] | None] | None = None
 
 _STATS_TOP_URL = "https://stats.ppq.ai/_dash-update-component"
 _STATS_TOP_TTL_S = 3600.0        # successful fetch cached 1 h
@@ -152,7 +167,8 @@ _STATS_TOP_RETRY_S = 600.0       # after a failure, wait 10 min before retrying
 _STATS_TOP_LIMIT = 6             # keep the picker's curated block small
 _stats_cache: tuple[float, list[str]] | None = None
 _stats_last_attempt = 0.0
-_stats_ok = False
+_stats_thread: threading.Thread | None = None
+_stats_thread_lock = threading.Lock()
 
 _GENERIC_FALLBACK_MODELS: tuple[str, ...] = (
     # Layer C — curated from stats.ppq.ai "Top Chat Models (Last 7 Days)"
@@ -171,11 +187,12 @@ def _load_pins_override() -> list[str] | None:
     """Layer A: user-local pins.json. None = absent/empty/invalid → generic layers."""
     global _pins_cache
     now = time.monotonic()
-    if _pins_cache and _pins_cache[0] > now:
-        return _pins_cache[1]
+    target = _pins_path()
+    if _pins_cache and _pins_cache[0] > now and _pins_cache[1] == target:
+        return _pins_cache[2]
     pins: list[str] | None = None
     try:
-        with open(_PINS_PATH, encoding="utf-8") as fh:
+        with open(target, encoding="utf-8") as fh:
             data = json.load(fh)
         raw = data.get("models") if isinstance(data, dict) else data
         if isinstance(raw, list):
@@ -185,7 +202,7 @@ def _load_pins_override() -> list[str] | None:
         pass
     except Exception:
         pass  # malformed file → treated as absent rather than breaking the picker
-    _pins_cache = (now + _PINS_TTL_S, pins)
+    _pins_cache = (now + _PINS_TTL_S, target, pins)
     return pins
 
 
@@ -206,7 +223,7 @@ def _fetch_stats_top_models(timeout: float = 4.0) -> list[str]:
             headers={
                 "Content-Type": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": "ppq-hermes-plugin/0.3.0",
+                "User-Agent": "ppq-hermes-plugin/0.3.1",
             },
             method="POST",
         )
@@ -233,20 +250,42 @@ def _fetch_stats_top_models(timeout: float = 4.0) -> list[str]:
 
 
 def _stats_top_models() -> list[str] | None:
-    """Layer B with TTL cache + failure backoff. None = no fresh answer."""
-    global _stats_cache, _stats_last_attempt, _stats_ok
+    """Layer B read: serves only a fresh cache; a miss kicks a background refresh.
+
+    Never blocks the picker build: the 4 s Dash POST runs on a daemon thread,
+    so no picker build ever pays the network stall (Hermes builds pickers for
+    every provider, including ones nobody picks). Bounded: at most one refresh
+    in flight, at most one attempt per _STATS_TOP_RETRY_S after a failure.
+    The picker serves Layer C until the refresh lands (next build), then B.
+    """
+    global _stats_last_attempt
     now = time.monotonic()
     if _stats_cache and _stats_cache[0] > now:
         return _stats_cache[1]
-    if not _stats_ok and now - _stats_last_attempt < _STATS_TOP_RETRY_S:
-        return None  # recent failure: don't re-pay the timeout on every call
+    if now - _stats_last_attempt >= _STATS_TOP_RETRY_S:
+        _stats_last_attempt = now
+        _kick_stats_refresh()
+    return None
+
+
+def _kick_stats_refresh() -> None:
+    """Start the background Layer B fetch; no-op while one is in flight."""
+    global _stats_thread
+    with _stats_thread_lock:
+        if _stats_thread is not None and _stats_thread.is_alive():
+            return
+        _stats_thread = threading.Thread(target=_stats_refresh_job, daemon=True)
+        _stats_thread.start()
+
+
+def _stats_refresh_job() -> None:
+    """Background body of the Layer B fetch; fills the cache on success."""
+    global _stats_cache, _stats_last_attempt
+    now = time.monotonic()
     _stats_last_attempt = now
     ids = _fetch_stats_top_models()
     if ids:
-        _stats_ok = True
         _stats_cache = (now + _STATS_TOP_TTL_S, ids[:_STATS_TOP_LIMIT])
-        return _stats_cache[1]
-    return None
 
 
 class PPQProfile(ProviderProfile):
@@ -407,7 +446,7 @@ ppq = PPQProfile(
     auth_type="api_key",
     api_mode="chat_completions",
     default_aux_model="z-ai/glm-5.3-flash",
-    default_headers={"User-Agent": "ppq-hermes-plugin/0.3.0"},
+    default_headers={"User-Agent": "ppq-hermes-plugin/0.3.1"},
     # No hardcoded fallback_models: the curated picker block is layered at
     # runtime — user pins.json (A) → stats.ppq.ai top chat models (B) →
     # generic static list (C). See the "Model picker pins" section above.

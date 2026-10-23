@@ -4,8 +4,8 @@ Hermes model-provider plugin for **PayPerQ** ([ppq.ai](https://ppq.ai)) — an
 OpenAI-compatible inference relay with per-response cost estimation and
 opt-in privacy routing (Zero Data Retention / TEE).
 
-> **Status:** draft for publication — contents below are a proposal and have
-> **NOT** been pushed or published anywhere yet.
+> **Status:** under review — catalog PR
+> [NousResearch/hermes-agent#142626](https://github.com/NousResearch/hermes-agent/pull/142626).
 
 ## What this plugin adds on top of a plain OpenAI-compatible provider
 
@@ -13,14 +13,14 @@ opt-in privacy routing (Zero Data Retention / TEE).
   `payperq`, `ppq-inference`; base URL `https://api.ppq.ai/v1`).
 - **Chat model discovery** via `GET /v1/models`, filtered to chat-type
   models, with a **3-layer pin fallback** that survives a failed fetch:
-  user-local pins (`~/.hermes/ppq-plugin/pins.json`) → live "top chat
+  user-local pins (`~/.hermes/plugin-data/ppq/pins.json`) → live "top chat
   models" from ppq's public stats dashboard → a small generic static list.
   Generic installs never see the author's personal pins (see
   [Customizing model pins](#customizing-model-pins)).
 - **Per-response cost estimation.** ppq's relay endpoint is deliberately
   unpriced by Hermes' bundled tables (custom base URLs never inherit a
   vendor list price), so the plugin reads a local snapshot of ppq's
-  published rate card (`$HERMES_HOME/ppq-pricing/prices.json`, refreshed
+  published rate card (`$HERMES_HOME/plugin-data/ppq/prices.json`, refreshed
   every 2 days by an optional `ppq-price-watch` cron script — not shipped
   in this repo) and prices each response from it. Without the snapshot,
   responses are honestly reported as `unknown cost` rather than guessed.
@@ -61,7 +61,7 @@ Then set `PPQ_API_KEY` and restart the Hermes gateway so the plugin loads.
 The model picker's curated "pinned" block (which leads ahead of the live
 catalog) resolves in three layers, checked in order:
 
-1. **User-local override** — if the file `~/.hermes/ppq-plugin/pins.json`
+1. **User-local override** — if the file `~/.hermes/plugin-data/ppq/pins.json`
    exists and is a non-empty JSON list (or `{"models": [...]}`) of model
    ids, those ids are used **entirely**, replacing both layers below. This
    file lives outside the plugin directory on purpose, so plugin
@@ -79,8 +79,8 @@ catalog) resolves in three layers, checked in order:
 Example — to pin your own preferred models, create the pins file:
 
 ```bash
-mkdir -p ~/.hermes/ppq-plugin
-cat > ~/.hermes/ppq-plugin/pins.json <<'EOF'
+mkdir -p ~/.hermes/plugin-data/ppq
+cat > ~/.hermes/plugin-data/ppq/pins.json <<'EOF'
 [
   "deepseek/deepseek-v4.1-flash",
   "z-ai/glm-5.3-flash",
@@ -141,7 +141,7 @@ request option — there is nothing to opt into. Two paths:
 
 ## Files
 
-- `model-providers/ppq/plugin.yaml` — plugin manifest (`version: 0.3.0`)
+- `model-providers/ppq/plugin.yaml` — plugin manifest (`version: 0.3.1`)
 - `model-providers/ppq/__init__.py` — provider profile: rate-card cost hook,
   ZDR opt-in routing, `fetch_models`, 3-layer picker pins (user pins file →
   live stats top models → generic static fallback)
